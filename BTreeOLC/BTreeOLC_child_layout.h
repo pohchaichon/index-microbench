@@ -20,7 +20,7 @@ namespace btreeolc {
 
 enum class PageType : uint8_t { BTreeInner=1, BTreeLeaf=2 };
 
-static const uint64_t pageSize=4*1024;
+static const uint64_t pageSize=512;
 
 struct OptLock {
   std::atomic<uint64_t> typeVersionLockObsolete{0b100};
@@ -96,6 +96,8 @@ struct BTreeLeaf : public BTreeLeafBase {
    // This is the array that we perform search on
    KeyValueType data[maxEntries];
 
+   BTreeLeaf<Key, Payload> *next_leaf=nullptr;
+
    BTreeLeaf() {
       count=0;
       type=typeMarker;
@@ -147,6 +149,7 @@ struct BTreeLeaf : public BTreeLeafBase {
       newLeaf->count = count-(count/2);
       count = count-newLeaf->count;
       memcpy(newLeaf->data, data+count, sizeof(KeyValueType)*newLeaf->count);
+      this->next_leaf = newLeaf;
       //memcpy(newLeaf->payloads, payloads+count, sizeof(Payload)*newLeaf->count);
       sep = data[count-1].first;
       return newLeaf;
@@ -405,27 +408,28 @@ struct BTree {
     return success;
   }
 
-  uint64_t scan(Key k, int range, Value* output) {
+  uint64_t scan(Key k, int range, std::pair<Key,Value> *output) {
     int restartCount = 0;
-  restart:
+    restart:
     if (restartCount++)
       yield(restartCount);
     bool needRestart = false;
 
-    NodeBase* node = root;
+    NodeBase *node = root;
     uint64_t versionNode = node->readLockOrRestart(needRestart);
-    if (needRestart || (node!=root)) goto restart;
+    if (needRestart || (node != root)) goto restart;
 
     // Parent of current node
-    BTreeInner<Key>* parent = nullptr;
+    BTreeInner<Key> *parent = nullptr;
     uint64_t versionParent;
 
-    while (node->type==PageType::BTreeInner) {
-      auto inner = static_cast<BTreeInner<Key>*>(node);
+    // Find the corresponding leaf
+    while (node->type == PageType::BTreeInner) {
+      auto inner = static_cast<BTreeInner<Key> *>(node);
 
       if (parent) {
-	parent->readUnlockOrRestart(versionParent, needRestart);
-	if (needRestart) goto restart;
+        parent->readUnlockOrRestart(versionParent, needRestart);
+        if (needRestart) goto restart;
       }
 
       parent = inner;
@@ -437,22 +441,31 @@ struct BTree {
       versionNode = node->readLockOrRestart(needRestart);
       if (needRestart) goto restart;
     }
-
-    BTreeLeaf<Key,Value>* leaf = static_cast<BTreeLeaf<Key,Value>*>(node);
-    unsigned pos = leaf->lowerBound(k);
-    int count = 0;
-    for (unsigned i=pos; i<leaf->count; i++) {
-      if (count==range)
-	break;
-      output[count++] = leaf->data[i].second;
-    }
-
     if (parent) {
       parent->readUnlockOrRestart(versionParent, needRestart);
       if (needRestart) goto restart;
     }
-    node->readUnlockOrRestart(versionNode, needRestart);
-    if (needRestart) goto restart;
+
+    NodeBase *next_node;
+    int count = 0;
+    while(node && count < range) {
+      versionNode = node->readLockOrRestart(needRestart);
+      if (needRestart) goto restart;
+      BTreeLeaf<Key, Value> *leaf = static_cast<BTreeLeaf<Key, Value> *>(node);
+      unsigned pos = 0;
+      if(count == 0){
+        pos = leaf->lowerBound(k);
+      }
+      for (unsigned i = pos; i < leaf->count; i++) {
+        if (count == range)
+          break;
+        output[count++] = {leaf->data[i].first, leaf->data[i].second};
+      }
+      next_node = leaf->next_leaf;
+      node->readUnlockOrRestart(versionNode, needRestart);
+      if (needRestart) goto restart;
+      node = next_node;
+    }
 
     return count;
   }
